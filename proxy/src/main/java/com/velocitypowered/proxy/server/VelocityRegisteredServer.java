@@ -101,8 +101,25 @@ public class VelocityRegisteredServer implements RegisteredServer, ForwardingAud
   }
 
   @Override
+  public long getTotalPlayerCount() {
+    if (this.server.getMultiProxyHandler().isRedisEnabled()) {
+      int amount = 0;
+
+      for (RemotePlayerInfo info : this.server.getMultiProxyHandler().getAllPlayers()) {
+        if (info.getServerName() != null && info.getServerName().equalsIgnoreCase(getServerInfo().getName())) {
+          amount++;
+        }
+      }
+
+      return amount;
+    } else {
+      return getPlayersConnected().size();
+    }
+  }
+
+  @Override
   public List<PlayerInfo> getPlayerInfo() {
-    if (!this.server.getMultiProxyHandler().isEnabled()) {
+    if (this.server == null || !this.server.getMultiProxyHandler().isRedisEnabled()) {
       List<PlayerInfo> info = new ArrayList<>();
       players.forEach((uuid, player) -> info.add(new PlayerInfo(player.getUsername(), player.getUniqueId())));
       return info;
@@ -167,7 +184,7 @@ public class VelocityRegisteredServer implements RegisteredServer, ForwardingAud
       if (future.isSuccess()) {
         MinecraftConnection conn = future.channel().pipeline().get(MinecraftConnection.class);
         PingSessionHandler handler = new PingSessionHandler(pingFuture,
-            VelocityRegisteredServer.this, conn, pingOptions.getProtocolVersion());
+            VelocityRegisteredServer.this, conn, pingOptions.getProtocolVersion(), pingOptions.getVirtualHost());
         conn.setActiveSessionHandler(StateRegistry.HANDSHAKE, handler);
       } else {
         pingFuture.completeExceptionally(future.cause());
@@ -247,6 +264,6 @@ public class VelocityRegisteredServer implements RegisteredServer, ForwardingAud
    * @return The queue status of the server
    */
   public ServerQueueStatus getQueueStatus() {
-    return requireNonNull(this.server).getQueueManager().getQueue(serverInfo.getName());
+    return this.server.getQueueManager().getQueue(serverInfo.getName());
   }
 }

@@ -39,8 +39,6 @@ import com.velocitypowered.proxy.protocol.packet.JoinGamePacket;
 import com.velocitypowered.proxy.protocol.packet.KeepAlivePacket;
 import com.velocitypowered.proxy.protocol.packet.PluginMessagePacket;
 import com.velocitypowered.proxy.queue.ServerQueueStatus;
-import com.velocitypowered.proxy.redis.multiproxy.RedisQueueLeaveRequest;
-import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -65,8 +63,8 @@ public class TransitionSessionHandler implements MinecraftSessionHandler {
    * @param resultFuture the result future
    */
   TransitionSessionHandler(final VelocityServer server,
-      final VelocityServerConnection serverConn,
-      final CompletableFuture<Impl> resultFuture) {
+                           final VelocityServerConnection serverConn,
+                           final CompletableFuture<Impl> resultFuture) {
     this.server = server;
     this.serverConn = serverConn;
     this.resultFuture = resultFuture;
@@ -156,28 +154,22 @@ public class TransitionSessionHandler implements MinecraftSessionHandler {
             serverConn.ensureConnected().write(player.getClientSettingsPacket());
           }
 
-          if (server.getMultiProxyHandler().isEnabled()) {
+          if (server.getMultiProxyHandler().isRedisEnabled()) {
             server.getMultiProxyHandler().handleServerSwitch(player,
                 serverConn.getServerInfo().getName());
           }
 
-          if (this.server.getQueueManager().isEnabled()) {
-            if (this.server.getRedisManager().isEnabled()) {
-              this.server.getRedisManager().send(new RedisQueueLeaveRequest(player.getUniqueId(),
-                  serverConn.getServer().getServerInfo().getName(),
-                  false));
-            } else {
-              ServerQueueStatus status = this.server.getQueueManager().getQueue(serverConn.getServer()
-                  .getServerInfo().getName());
-              status.dequeue(player.getUniqueId(), false);
-            }
+          if (this.server.getQueueManager().isQueueEnabled()) {
+            ServerQueueStatus status = this.server.getQueueManager().getQueue(serverConn.getServer()
+                .getServerInfo().getName());
+            status.dequeue(player.getUniqueId(), false);
           }
 
           // We're done! :)
           server.getEventManager().fireAndForget(new ServerPostConnectEvent(player,
               previousServer));
           resultFuture.complete(ConnectionRequestResults.successful(serverConn.getServer()));
-        }, smc.eventLoop()).exceptionally(exc -> {
+        }, smc.eventLoop()).exceptionallyAsync(exc -> {
           logger.error("Unable to switch to new server {} for {}",
               serverConn.getServerInfo().getName(),
               player.getUsername(), exc);
@@ -236,7 +228,7 @@ public class TransitionSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void disconnected() {
-    resultFuture
-        .completeExceptionally(new IOException("Unexpectedly disconnected from remote server"));
+    final ConnectedPlayer player = serverConn.getPlayer();
+    player.teardown();
   }
 }

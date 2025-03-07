@@ -21,17 +21,12 @@ import com.velocitypowered.proxy.redis.RedisPacket;
 import java.util.UUID;
 
 /**
- * Represents a packet to handle the connection of a user in a queue of a server.
- * This is only handled by the master-proxy-id as defined in the default velocity config.
+ * Sends a request to kick a player.
  *
- * @param playerUuid The UUID of the player that's being added to the queue.
- * @param serverName The name of the server which the player is being de-queued for.
- * @param successfulTransfer Whether the transfer was successful or not.
- * @param id A unique ID linked to the status, so the other proxy can reply to the same message.
+ * @param player The UUID of the player.
  */
-public record RedisQueueSendStatusRequest(UUID playerUuid, String serverName,
-                                          boolean successfulTransfer, UUID id) implements RedisPacket {
-  public static final String ID = "redis-queue-send-status";
+public record RedisKickPlayerRequest(UUID player, String proxyId) implements RedisPacket {
+  public static final String ID = "kick-player-request";
 
   @Override
   public String getId() {

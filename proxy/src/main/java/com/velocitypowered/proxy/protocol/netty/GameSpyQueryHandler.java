@@ -87,7 +87,7 @@ public class GameSpyQueryHandler extends SimpleChannelInboundHandler<DatagramPac
   private QueryResponse createInitialResponse() {
 
     final int online;
-    if (server.getMultiProxyHandler().isEnabled()) {
+    if (server.getMultiProxyHandler().isRedisEnabled()) {
       online = server.getMultiProxyHandler().getTotalPlayerCount();
     } else {
       online = server.getPlayerCount();
@@ -193,7 +193,7 @@ public class GameSpyQueryHandler extends SimpleChannelInboundHandler<DatagramPac
               DatagramPacket responsePacket = new DatagramPacket(queryResponse, msg.sender());
               ctx.writeAndFlush(responsePacket, ctx.voidPromise());
             }, ctx.channel().eventLoop())
-            .exceptionally((ex) -> {
+            .exceptionallyAsync((ex) -> {
               LogManager.getLogger(getClass()).error(
                   "Exception while writing GS4 response for query from {}", senderAddress, ex);
               return null;

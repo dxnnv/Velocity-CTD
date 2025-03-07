@@ -24,23 +24,29 @@ import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.config.VelocityConfiguration;
 import com.velocitypowered.proxy.connection.client.ConnectedPlayer;
 import com.velocitypowered.proxy.plugin.virtual.VelocityVirtualPlugin;
+import com.velocitypowered.proxy.queue.cache.QueueCacheRetriever;
 import com.velocitypowered.proxy.server.VelocityRegisteredServer;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import net.kyori.adventure.text.Component;
 
 /**
  * The interface (abstract class) that will provide methods for the Queue Manager implementations.
  */
 public abstract class QueueManager {
   protected final VelocityServer server;
-  protected final VelocityConfiguration.Queue config;
+  protected VelocityConfiguration.Queue config;
   protected ScheduledTask tickMessageTaskHandle;
   protected ScheduledTask tickPingingBackendTaskHandle;
-  protected final Map<String, ServerQueueStatus> serverQueues = new HashMap<>();
 
   private final boolean enabled;
+
+  protected QueueCacheRetriever cache = null;
+
+  protected static Map<String, Long> LAST_TURNED_ONLINE_TIME = new HashMap<>();
+  private ScheduledTask sendingTaskHandle = null;
 
   /**
    * Initializes a new Queue Manager with the proxy and config.
@@ -56,8 +62,16 @@ public abstract class QueueManager {
       return;
     }
 
+    restartTasks();
+  }
+
+  /**
+   * Restarts all scheduled tasks for the queue manager.
+   */
+  public void restartTasks() {
     this.schedulePingingBackend();
     this.scheduleTickMessage();
+    this.rescheduleTimerTask();
   }
 
   /**
@@ -71,8 +85,8 @@ public abstract class QueueManager {
     if (registeredServer == null) {
       return null;
     }
-    return serverQueues.computeIfAbsent(server, status ->
-        new ServerQueueStatus((VelocityRegisteredServer) registeredServer, this.server));
+
+    return cache.get(server);
   }
 
   /**
@@ -94,7 +108,8 @@ public abstract class QueueManager {
 
     this.tickMessageTaskHandle = server.getScheduler()
         .buildTask(VelocityVirtualPlugin.INSTANCE, this::tickMessageForAllPlayers)
-        .repeat((int) (config.getMessageDelay() * 1000), TimeUnit.MILLISECONDS)
+        .delay((long) (config.getMessageDelay() * 1000), TimeUnit.MILLISECONDS)
+        .repeat((long) (config.getMessageDelay() * 1000), TimeUnit.MILLISECONDS)
         .schedule();
   }
 
@@ -108,14 +123,25 @@ public abstract class QueueManager {
     }
 
     this.tickPingingBackendTaskHandle = server.getScheduler()
-        .buildTask(VelocityVirtualPlugin.INSTANCE, () -> {
-          for (RegisteredServer serverApi : this.server.getAllServers()) {
-            VelocityRegisteredServer server = (VelocityRegisteredServer) serverApi;
-            ServerQueueStatus queueStatus = getQueue(server.getServerInfo().getName());
-            queueStatus.tickPingingBackend();
-          }
-        })
-        .repeat((int) (config.getBackendPingInterval() * 1000), TimeUnit.MILLISECONDS)
+        .buildTask(VelocityVirtualPlugin.INSTANCE, this::tickPingingBackend)
+        .delay((long) (config.getBackendPingInterval() * 1000), TimeUnit.MILLISECONDS)
+        .repeat((long) (config.getBackendPingInterval() * 1000), TimeUnit.MILLISECONDS)
+        .schedule();
+  }
+
+  /**
+   * Reschedules the task responsible for processing and sending queued players to their destination servers.
+   * This method cancels any existing task associated with sending queued players and schedules a new task.
+   * The new task runs periodically based on the configured delay specified in the queue settings.
+   */
+  public void rescheduleTimerTask() {
+    if (this.sendingTaskHandle != null) {
+      this.sendingTaskHandle.cancel();
+    }
+
+    this.sendingTaskHandle = server.getScheduler()
+        .buildTask(VelocityVirtualPlugin.INSTANCE, this::tickSending)
+        .repeat((long) (config.getSendDelay() * 1000), TimeUnit.MILLISECONDS)
         .schedule();
   }
 
@@ -124,7 +150,111 @@ public abstract class QueueManager {
    *
    * @param player The player that left.
    */
-  public abstract void onPlayerLeave(ConnectedPlayer player);
+  public void onPlayerLeave(final ConnectedPlayer player) {
+    long timeout = getTimeoutInSeconds(player);
+
+    if (timeout == -1) {
+      removeFromAll(player);
+    } else {
+      this.server.getScheduler().buildTask(VelocityVirtualPlugin.INSTANCE, ()
+          -> removeFromAll(player)).delay(getTimeoutInSeconds(player), TimeUnit.SECONDS).schedule();
+    }
+  }
+
+  /**
+   * Sends the next player in queue, unless the queue is paused.
+   */
+  public void tickSending() {
+    if (!isMasterProxy()) {
+      return;
+    }
+
+    cache.getAll().forEach(queue -> {
+      if (queue.isPaused() || !queue.isOnline()) {
+        return;
+      }
+
+      if (queue.getQueue().isEmpty()) {
+        return;
+      }
+
+      ServerQueueEntry entry = queue.getQueue().peekFirst();
+
+      if (entry == null || queue.isFull() && !entry.isFullBypass()) {
+        return;
+      }
+
+      if (this.server.getMultiProxyHandler().isRedisEnabled()) {
+        if (this.server.getMultiProxyHandler().isPlayerOnline(entry.getPlayer())) {
+          queue.sendFirstInQueue(entry);
+        } else {
+          queue.getQueue().pollFirst();
+          this.server.getRedisManager().addOrUpdateQueue(queue);
+        }
+      } else {
+        if (this.server.getPlayer(entry.getPlayer()).orElse(null) != null) {
+          queue.sendFirstInQueue(entry);
+        } else {
+          queue.getQueue().pollFirst();
+        }
+      }
+    });
+  }
+
+  /**
+   * Pings the backend to update the online flag.
+   */
+  public void tickPingingBackend() {
+    List<ServerQueueStatus> queues = this.cache.getAll();
+    for (ServerQueueStatus queue : queues) {
+      RegisteredServer s = this.server.getServer(queue.getServerName()).orElse(null);
+      if (s == null) {
+        continue;
+      }
+
+      s.ping().whenCompleteAsync((result, th) -> {
+        double queueDelay = this.server.getConfiguration().getQueue().getQueueDelay() * 1000;
+
+        if (th != null) {
+          queue.setStatus(ServerStatus.OFFLINE);
+        }
+
+        if (queue.getStatus() == ServerStatus.OFFLINE && th == null) {
+          queue.setStatus(ServerStatus.WAITING);
+          LAST_TURNED_ONLINE_TIME.put(queue.getServerName(), System.currentTimeMillis());
+        }
+
+        if (th == null && System.currentTimeMillis()
+            >= LAST_TURNED_ONLINE_TIME.get(queue.getServerName()) + queueDelay
+            && queue.getStatus() == ServerStatus.WAITING) {
+          queue.setStatus(ServerStatus.ONLINE);
+        }
+
+        ServerStatus temp = queue.getStatus();
+
+        if (temp != ServerStatus.ONLINE && queue.isOnline()) {
+          for (ServerQueueEntry entry : queue.getQueue()) {
+            if (entry.isQueueBypass()) {
+              entry.send();
+              queue.dequeue(entry.getPlayer(), false);
+            }
+          }
+        }
+
+        if (queue.isOnline()) {
+          final int maxPlayers = this.server.getConfiguration().getPlayerCaps().get(queue.getServerName());
+          long playerCount;
+          if (this.server.getMultiProxyHandler().isRedisEnabled()) {
+            playerCount = this.server.getMultiProxyHandler().getAllPlayers().stream().filter(info -> info.getServerName() != null
+                && info.getServerName().equalsIgnoreCase(queue.getServerName())).count();
+          } else {
+            playerCount = server.getPlayerCount();
+          }
+          queue.setFull(playerCount >= maxPlayers);
+        }
+      });
+    }
+  }
 
   /**
    * Gets the timeout in seconds at which the player will be removed from a queue
@@ -135,12 +265,16 @@ public abstract class QueueManager {
    * @return The timeout in seconds at which the player will be removed from a queue after leaving the server.
    */
   protected int getTimeoutInSeconds(final ConnectedPlayer player) {
+    if (player.hasPermission("velocity.queue.timeout.exempt")) {
+      return 0;
+    }
+
     for (int i = 86400; i > 0; i--) {
       if (player.hasPermission("velocity.queue.timeout." + i)) {
         return i;
       }
     }
-    return 1;
+    return -1;
   }
 
   /**
@@ -149,7 +283,52 @@ public abstract class QueueManager {
    * @param player The player to add to the queue.
    * @param server The server to add the player to the queue to.
   */
-  public abstract void queue(Player player, VelocityRegisteredServer server);
+  public void queue(final Player player, final VelocityRegisteredServer server) {
+    if (!isQueueEnabled() || player.hasPermission("velocity.queue.bypass")) {
+      player.createConnectionRequest(server).connectWithIndication();
+      return;
+    }
+
+    String targetServerName = server.getServerInfo().getName();
+
+    ServerQueueStatus targetQueueStatus = getQueue(targetServerName);
+    if (targetQueueStatus != null && targetQueueStatus.isQueued(player.getUniqueId())) {
+      player.sendMessage(Component.translatable("velocity.queue.error.already-queued")
+          .arguments(Component.text(targetServerName)));
+      return;
+    }
+
+    if (!this.server.getConfiguration().getQueue().isAllowMultiQueue()) {
+      for (ServerQueueStatus status : this.cache.getAll()) {
+        if (status.isQueued(player.getUniqueId())) {
+          status.dequeue(player.getUniqueId(), false);
+          player.sendMessage(Component.translatable("velocity.queue.error.queued-swap")
+              .arguments(
+                  Component.text(status.getServerName()),
+                  Component.text(targetServerName)));
+          break;
+        }
+      }
+    }
+
+    ServerQueueStatus status = getQueue(targetServerName);
+    if (status == null) {
+      throw new IllegalArgumentException("No queue found for server '" + targetServerName + "'");
+    }
+
+    if (status.isPaused() && !this.server.getConfiguration().getQueue().isAllowPausedQueueJoining()) {
+      player.sendMessage(Component.translatable("velocity.queue.error.paused")
+          .arguments(Component.text(targetServerName)));
+      return;
+    }
+
+    status.queue(player.getUniqueId(), player.getQueuePriority(server.getServerInfo().getName()),
+        player.hasPermission("velocity.queue.full.bypass"),
+        player.hasPermission("velocity.queue.bypass"));
+
+    player.sendMessage(Component.translatable("velocity.queue.command.queued")
+        .arguments(Component.text(targetServerName)));
+  }
 
   /**
    * Sends the actionbar message to all players.
@@ -160,17 +339,18 @@ public abstract class QueueManager {
    * Reloads the config for every server that has a queue.
    */
   public void reloadConfig() {
-    for (ServerQueueStatus server : this.serverQueues.values()) {
+    this.config = server.getConfiguration().getQueue();
+    for (ServerQueueStatus server : this.cache.getAll()) {
       server.reloadConfig();
     }
+    restartTasks();
   }
 
   /**
    * Clears all the queues and stops the tasks.
    */
   public void clearQueue() {
-    for (ServerQueueStatus status : this.serverQueues.values()) {
-
+    for (ServerQueueStatus status : this.cache.getAll()) {
       status.stop();
     }
 
@@ -189,7 +369,7 @@ public abstract class QueueManager {
    * @return All the queues.
    */
   public List<ServerQueueStatus> getAll() {
-    return this.serverQueues.values().stream().toList();
+    return this.cache.getAll();
   }
 
   /**
@@ -197,7 +377,7 @@ public abstract class QueueManager {
    *
    * @return Whether the queue system is enabled or not.
    */
-  public boolean isEnabled() {
+  public boolean isQueueEnabled() {
     return enabled;
   }
 
@@ -206,5 +386,11 @@ public abstract class QueueManager {
    *
    * @param player The player to remove.
    */
-  public abstract void removeFromAll(ConnectedPlayer player);
+  public void removeFromAll(final ConnectedPlayer player) {
+    for (ServerQueueStatus status : this.cache.getAll()) {
+      if (status.isQueued(player.getUniqueId())) {
+        status.dequeue(player.getUniqueId(), false);
+      }
+    }
+  }
 }

@@ -68,7 +68,7 @@ public class StatusSessionHandler implements MinecraftSessionHandler {
     }
     this.pingReceived = true;
     server.getServerListPingHandler().getInitialPing(this.inbound)
-        .thenCompose(ping -> server.getEventManager().fire(new ProxyPingEvent(inbound, ping)))
+        .thenComposeAsync(ping -> server.getEventManager().fire(new ProxyPingEvent(inbound, ping)))
         .thenAcceptAsync(event -> {
           if (event.getResult().isAllowed()) {
             connection.closeWith(LegacyDisconnect.fromServerPing(event.getPing(), packet.getVersion()));
@@ -76,7 +76,7 @@ public class StatusSessionHandler implements MinecraftSessionHandler {
             connection.close();
           }
         }, connection.eventLoop())
-        .exceptionally((ex) -> {
+        .exceptionallyAsync((ex) -> {
           logger.error("Exception while handling legacy ping {}", packet, ex);
           return null;
         });
@@ -97,28 +97,27 @@ public class StatusSessionHandler implements MinecraftSessionHandler {
     this.pingReceived = true;
 
     this.server.getServerListPingHandler().getInitialPing(inbound)
-        .thenCompose(ping -> server.getEventManager().fire(new ProxyPingEvent(inbound, ping)))
+        .thenComposeAsync(ping -> server.getEventManager().fire(new ProxyPingEvent(inbound, ping)))
         .thenAcceptAsync(
             (event) -> {
               if (event.getResult().isAllowed()) {
                 final StringBuilder json = new StringBuilder();
                 VelocityServer.getPingGsonInstance(connection.getProtocolVersion())
                         .toJson(event.getPing(), json);
-
                 connection.write(new StatusResponsePacket(json));
               } else {
                 connection.close();
               }
             },
             connection.eventLoop())
-        .exceptionally((ex) -> {
+        .exceptionallyAsync((ex) -> {
           logger.error("Exception while handling status request {}", packet, ex);
           return null;
         });
     return true;
   }
 
-  private ByteBuf encode(String response) {
+  private ByteBuf encode(final String response) {
     ByteBuf buf = Unpooled.buffer();
     buf.writeByte(0xFF);
 

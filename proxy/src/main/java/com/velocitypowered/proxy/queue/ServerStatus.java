@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Velocity Contributors
+ * Copyright (C) 2020-2024 Velocity Contributors
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,22 +15,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package com.velocitypowered.proxy.redis.multiproxy;
-
-import com.velocitypowered.proxy.redis.RedisPacket;
-import java.util.UUID;
+package com.velocitypowered.proxy.queue;
 
 /**
- * Creates a packet that updates the queued server.
- *
- * @param uuid The UUID of the player.
+ * server status.
  */
-public record RedisUpdateQueuedServerRequest(UUID uuid) implements RedisPacket {
-
-  public static final String ID = "redis-update-queued-server";
-
-  @Override
-  public String getId() {
-    return ID;
-  }
+public enum ServerStatus {
+  OFFLINE,
+  WAITING,
+  ONLINE
 }

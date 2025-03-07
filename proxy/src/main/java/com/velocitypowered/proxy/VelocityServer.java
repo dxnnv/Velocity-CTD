@@ -52,7 +52,6 @@ import com.velocitypowered.proxy.command.builtin.PlistCommand;
 import com.velocitypowered.proxy.command.builtin.QueueAdminCommand;
 import com.velocitypowered.proxy.command.builtin.SendCommand;
 import com.velocitypowered.proxy.command.builtin.ServerCommand;
-import com.velocitypowered.proxy.command.builtin.ShowAllCommand;
 import com.velocitypowered.proxy.command.builtin.ShutdownCommand;
 import com.velocitypowered.proxy.command.builtin.SlashServerCommand;
 import com.velocitypowered.proxy.command.builtin.TransferCommand;
@@ -185,6 +184,7 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
   private final VelocityCommandManager commandManager;
   private final AtomicBoolean shutdownInProgress = new AtomicBoolean(false);
   private boolean shutdown = false;
+  private boolean startedShutdown = false;
   private final VelocityPluginManager pluginManager;
 
   private final Map<UUID, ConnectedPlayer> connectionsByUuid = new ConcurrentHashMap<>();
@@ -256,6 +256,10 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
     }
 
     return new ProxyVersion(implName, implVendor, implVersion);
+  }
+
+  public boolean isStartedShutdown() {
+    return this.startedShutdown;
   }
 
   private VelocityPluginContainer createVirtualPlugin() {
@@ -612,7 +616,7 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
         Optional<RegisteredServer> next = player.getNextServerToTry();
         if (next.isPresent()) {
           player.createConnectionRequest(next.get()).connectWithIndication()
-              .whenComplete((success, ex) -> {
+              .whenCompleteAsync((success, ex) -> {
                 if (ex != null || success == null || !success) {
                   player.disconnect(Component.text("Your server has been changed, but we could "
                       + "not move you to any fallback servers."));
@@ -665,7 +669,7 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
               player.setServerLinks(getConfiguration().getServerLinks());
             }
           } catch (IllegalStateException ignored) {
-            // Ignore illegal state to ensure each reload is successful.
+            // Ignore illegal state to ensure each viable reload is successful.
           }
         }
       }
@@ -683,7 +687,6 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
     unregisterCommand("plist");
     unregisterCommand("ping");
     unregisterCommand("send");
-    unregisterCommand("showall");
     unregisterCommand("hub");
     unregisterCommand("lobby");
     unregisterCommand("transfer");
@@ -728,10 +731,6 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
 
     if (!commandManager.hasCommand("send")) {
       new SendCommand(this).register(configuration.isSendEnabled());
-    }
-
-    if (!commandManager.hasCommand("showall")) {
-      new ShowAllCommand(this).register(configuration.isShowAllEnabled());
     }
 
     if (!commandManager.hasCommand("queueadmin")) {
@@ -786,7 +785,7 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
   }
 
   /**
-   * Loads the server list from the velocity configuration file.
+   * Loads the server list from the Velocity configuration file.
    */
   private static List<ServerInfo> loadServersFromNewList(final VelocityConfiguration config) {
     List<ServerInfo> serverList = new ArrayList<>();
@@ -814,6 +813,7 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
     }
 
     Runnable shutdownProcess = () -> {
+      startedShutdown = true;
       logger.info("Shutting down the proxy...");
 
       // Shutdown the connection manager, this should be
@@ -824,6 +824,10 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
       }
 
       ImmutableList<ConnectedPlayer> players = ImmutableList.copyOf(connectionsByUuid.values());
+
+      if (this.getQueueManager().isQueueEnabled()) {
+        players.forEach(p -> this.getQueueManager().removeFromAll(p));
+      }
 
       if (!getConfiguration().isAcceptTransfers()) {
         for (ConnectedPlayer player : players) {
@@ -842,7 +846,7 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
           if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_5)) {
             String connectedServer = player.getConnectedServer() != null ? player.getConnectedServer().getServerInfo().getName() : null;
 
-            if (this.getMultiProxyHandler().isEnabled()) {
+            if (this.getMultiProxyHandler().isRedisEnabled()) {
               getRedisManager().send(new RedisPlayerSetTransferringRequest(player.getUniqueId(), true,
                   connectedServer));
             }
@@ -936,6 +940,10 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
   private ProxyAddress getProxyAddressToUse() {
     final String filter = getConfiguration().getDynamicProxyFilter();
     List<ProxyAddress> addresses = new ArrayList<>(getConfiguration().getProxyAddresses().stream().toList());
+    if (addresses.isEmpty()) {
+      return null;
+    }
+
     if (getMultiProxyHandler().getOwnProxyId() != null) {
       addresses.removeIf(address -> getMultiProxyHandler().getOwnProxyId().equalsIgnoreCase(address.proxyId()));
     }
@@ -1127,6 +1135,11 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
   @Override
   public VelocityChannelRegistrar getChannelRegistrar() {
     return channelRegistrar;
+  }
+  
+  @Override
+  public boolean isShuttingDown() {
+    return shutdownInProgress.get();
   }
 
   @Override
